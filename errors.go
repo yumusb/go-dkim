@@ -24,7 +24,7 @@ var (
 	ErrCandNotParsePrivateKey = errors.New("can not parse private key, check format (pem) and validity")
 
 	// ErrSignBadAlgo Bad algorithm
-	ErrSignBadAlgo = errors.New("bad algorithm. Only rsa-sha1 or rsa-sha256 are permitted")
+	ErrSignBadAlgo = errors.New("bad algorithm. Only rsa-sha1, rsa-sha256, or ed25519-sha256 are permitted")
 
 	// ErrBadMailFormat unable to parse mail
 	ErrBadMailFormat = errors.New("bad mail format")
@@ -74,7 +74,7 @@ var (
 	// ErrVerifyVersionMusBeDkim1 if présent flag v (version) must be DKIM1
 	ErrVerifyVersionMusBeDkim1 = errors.New("flag v must be set to DKIM1")
 
-	// ErrVerifyBadKeyType bad type for pub key (only rsa is accepted)
+	// ErrVerifyBadKeyType bad type for pub key (only rsa and ed25519 are accepted)
 	ErrVerifyBadKeyType = errors.New("bad type for key type")
 
 	// ErrVerifyRevokedKey key(s) for this selector is revoked (p is empty)

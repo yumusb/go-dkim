@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"container/list"
 	"crypto"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
@@ -12,6 +13,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"hash"
 	"regexp"
 	"strings"
@@ -98,7 +100,7 @@ func NewSigOptions() SigOptions {
 
 // Sign signs an email
 func Sign(email *[]byte, options SigOptions) error {
-	var privateKey *rsa.PrivateKey
+	var privateKey crypto.Signer
 	var err error
 
 	// PrivateKey
@@ -110,12 +112,19 @@ func Sign(email *[]byte, options SigOptions) error {
 		return ErrCandNotParsePrivateKey
 	}
 
-	// try to parse it as PKCS1 otherwise try PKCS8
+	// try to parse it as PKCS1 (RSA only) otherwise try PKCS8 (RSA or Ed25519)
 	if key, err := x509.ParsePKCS1PrivateKey(d.Bytes); err != nil {
 		if key, err := x509.ParsePKCS8PrivateKey(d.Bytes); err != nil {
 			return ErrCandNotParsePrivateKey
 		} else {
-			privateKey = key.(*rsa.PrivateKey)
+			switch k := key.(type) {
+			case *rsa.PrivateKey:
+				privateKey = k
+			case ed25519.PrivateKey:
+				privateKey = k
+			default:
+				return ErrCandNotParsePrivateKey
+			}
 		}
 	} else {
 		privateKey = key
@@ -139,8 +148,20 @@ func Sign(email *[]byte, options SigOptions) error {
 
 	// Algo
 	options.Algo = strings.ToLower(options.Algo)
-	if options.Algo != "rsa-sha1" && options.Algo != "rsa-sha256" {
+	if options.Algo != "rsa-sha1" && options.Algo != "rsa-sha256" && options.Algo != "ed25519-sha256" {
 		return ErrSignBadAlgo
+	}
+
+	// Validate key type matches algorithm
+	switch privateKey.(type) {
+	case *rsa.PrivateKey:
+		if options.Algo == "ed25519-sha256" {
+			return errors.New("ed25519-sha256 algorithm requires Ed25519 key")
+		}
+	case ed25519.PrivateKey:
+		if options.Algo != "ed25519-sha256" {
+			return errors.New("Ed25519 key requires ed25519-sha256 algorithm")
+		}
 	}
 
 	// Header must contain "from"
@@ -183,7 +204,7 @@ func Sign(email *[]byte, options SigOptions) error {
 	headers = bytes.TrimRight(headers, " \r\n")
 
 	// sign
-	sig, err := getSignature(&headers, privateKey, signHash[1])
+	sig, err := getSignature(&headers, privateKey, options.Algo)
 
 	// add to DKIM-Header
 	subh := ""
@@ -266,7 +287,7 @@ func Verify(email *[]byte, opts ...DNSOpt) (verifyOutput, error) {
 	toSignStr := string(headers) + dkimHeaderCano
 	toSign := bytes.TrimRight([]byte(toSignStr), " \r\n")
 
-	err = verifySignature(toSign, dkimHeader.SignatureData, &pubKey.PubKey, sigHash[1])
+	err = verifySignature(toSign, dkimHeader.SignatureData, pubKey.PubKey, dkimHeader.Algorithm)
 	if err != nil {
 		return getVerifyOutput(PERMFAIL, err, pubKey.FlagTesting)
 	}
@@ -441,54 +462,84 @@ func getBodyHash(body *[]byte, algo string, bodyLength uint) (string, error) {
 }
 
 // getSignature return signature of toSign using key
-func getSignature(toSign *[]byte, key *rsa.PrivateKey, algo string) (string, error) {
-	var h1 hash.Hash
-	var h2 crypto.Hash
+func getSignature(toSign *[]byte, key crypto.Signer, algo string) (string, error) {
 	switch algo {
-	case "sha1":
-		h1 = sha1.New()
-		h2 = crypto.SHA1
-		break
-	case "sha256":
-		h1 = sha256.New()
-		h2 = crypto.SHA256
-		break
+	case "ed25519-sha256":
+		// Ed25519 signs the SHA256 hash of the message
+		h := sha256.New()
+		h.Write(*toSign)
+		digest := h.Sum(nil)
+		edKey, ok := key.(ed25519.PrivateKey)
+		if !ok {
+			return "", errors.New("invalid key type for ed25519-sha256")
+		}
+		sig := ed25519.Sign(edKey, digest)
+		return base64.StdEncoding.EncodeToString(sig), nil
+	case "rsa-sha1", "rsa-sha256":
+		var h1 hash.Hash
+		var h2 crypto.Hash
+		if algo == "rsa-sha1" {
+			h1 = sha1.New()
+			h2 = crypto.SHA1
+		} else {
+			h1 = sha256.New()
+			h2 = crypto.SHA256
+		}
+		h1.Write(*toSign)
+		rsaKey, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return "", errors.New("invalid key type for RSA algorithm")
+		}
+		sig, err := rsa.SignPKCS1v15(rand.Reader, rsaKey, h2, h1.Sum(nil))
+		if err != nil {
+			return "", err
+		}
+		return base64.StdEncoding.EncodeToString(sig), nil
 	default:
 		return "", ErrVerifyInappropriateHashAlgo
 	}
-
-	// sign
-	h1.Write(*toSign)
-	sig, err := rsa.SignPKCS1v15(rand.Reader, key, h2, h1.Sum(nil))
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(sig), nil
 }
 
 // verifySignature verify signature from pubkey
-func verifySignature(toSign []byte, sig64 string, key *rsa.PublicKey, algo string) error {
-	var h1 hash.Hash
-	var h2 crypto.Hash
-	switch algo {
-	case "sha1":
-		h1 = sha1.New()
-		h2 = crypto.SHA1
-		break
-	case "sha256":
-		h1 = sha256.New()
-		h2 = crypto.SHA256
-		break
-	default:
-		return ErrVerifyInappropriateHashAlgo
-	}
-
-	h1.Write(toSign)
+func verifySignature(toSign []byte, sig64 string, key interface{}, algo string) error {
 	sig, err := base64.StdEncoding.DecodeString(sig64)
 	if err != nil {
 		return err
 	}
-	return rsa.VerifyPKCS1v15(key, h2, h1.Sum(nil), sig)
+
+	switch algo {
+	case "ed25519-sha256":
+		edKey, ok := key.(ed25519.PublicKey)
+		if !ok {
+			return errors.New("invalid key type for ed25519-sha256")
+		}
+		// Ed25519 verifies the SHA256 hash of the message
+		h := sha256.New()
+		h.Write(toSign)
+		digest := h.Sum(nil)
+		if !ed25519.Verify(edKey, digest, sig) {
+			return errors.New("ed25519 signature verification failed")
+		}
+		return nil
+	case "rsa-sha1", "rsa-sha256":
+		rsaKey, ok := key.(*rsa.PublicKey)
+		if !ok {
+			return errors.New("invalid key type for RSA algorithm")
+		}
+		var h1 hash.Hash
+		var h2 crypto.Hash
+		if algo == "rsa-sha1" {
+			h1 = sha1.New()
+			h2 = crypto.SHA1
+		} else {
+			h1 = sha256.New()
+			h2 = crypto.SHA256
+		}
+		h1.Write(toSign)
+		return rsa.VerifyPKCS1v15(rsaKey, h2, h1.Sum(nil), sig)
+	default:
+		return ErrVerifyInappropriateHashAlgo
+	}
 }
 
 // removeFWS removes all FWS from string

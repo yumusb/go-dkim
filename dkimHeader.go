@@ -347,7 +347,7 @@ func parseDkHeader(header string) (dkh *DKIMHeader, err error) {
 			mandatoryFlags["v"] = true
 		case "a":
 			dkh.Algorithm = strings.ToLower(data)
-			if dkh.Algorithm != "rsa-sha1" && dkh.Algorithm != "rsa-sha256" {
+			if dkh.Algorithm != "rsa-sha1" && dkh.Algorithm != "rsa-sha256" && dkh.Algorithm != "ed25519-sha256" {
 				return nil, ErrSignBadAlgo
 			}
 			mandatoryFlags["a"] = true

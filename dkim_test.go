@@ -2,8 +2,10 @@ package dkim
 
 import (
 	//"fmt"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"net"
 	"testing"
@@ -448,4 +450,66 @@ func Test_SignatureExpiration(t *testing.T) {
 	status, err := Verify(&email, resolveTXT)
 	assert.Equal(t, TESTINGPERMFAIL, status)
 	assert.Equal(t, ErrVerifySignatureHasExpired, err)
+}
+
+func Test_Ed25519SignAndVerify(t *testing.T) {
+	// Generate Ed25519 key pair for testing
+	// Using a fixed seed for reproducibility
+	seed := []byte("12345678901234567890123456789012") // 32 bytes
+	privKeyEd := ed25519.NewKeyFromSeed(seed)
+	pubKeyEd := privKeyEd.Public().(ed25519.PublicKey)
+
+	// Convert to PKCS8 PEM format
+	pkcs8Bytes, err := x509.MarshalPKCS8PrivateKey(privKeyEd)
+	require.NoError(t, err)
+
+	privKeyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "PRIVATE KEY",
+		Bytes: pkcs8Bytes,
+	})
+
+	email := []byte(emailBase)
+
+	// Setup signing options
+	options := NewSigOptions()
+	options.PrivateKey = privKeyPEM
+	options.Domain = domain
+	options.Selector = "ed25519test"
+	options.Headers = []string{"from", "date", "subject"}
+	options.AddSignatureTimestamp = false
+	options.Algo = "ed25519-sha256"
+	options.Canonicalization = "relaxed/relaxed"
+
+	// Sign the email
+	emailCopy := append([]byte(nil), email...)
+	err = Sign(&emailCopy, options)
+	require.NoError(t, err)
+
+	// Verify the signed email
+	// Encode public key for DNS TXT record (raw 32-byte format)
+	pubKeyBase64 := base64.StdEncoding.EncodeToString(pubKeyEd)
+
+	resolveTXT := DNSOptLookupTXT(func(name string) ([]string, error) {
+		if name == "ed25519test._domainkey."+domain {
+			return []string{"v=DKIM1; k=ed25519; p=" + pubKeyBase64}, nil
+		}
+		return nil, net.ErrClosed
+	})
+
+	status, err := Verify(&emailCopy, resolveTXT)
+	assert.NoError(t, err)
+	assert.Equal(t, SUCCESS, status)
+}
+
+func Test_Ed25519KeyTypeValidation(t *testing.T) {
+	email := []byte(emailBase)
+	options := NewSigOptions()
+	options.PrivateKey = []byte(privKey) // RSA key
+	options.Domain = domain
+	options.Selector = selector
+	options.Algo = "ed25519-sha256" // Trying to use Ed25519 algo with RSA key
+
+	err := Sign(&email, options)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Ed25519")
 }

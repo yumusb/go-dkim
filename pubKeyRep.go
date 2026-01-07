@@ -1,6 +1,7 @@
 package dkim
 
 import (
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -16,7 +17,7 @@ type PubKeyRep struct {
 	HashAlgo     []string
 	KeyType      string
 	Note         string
-	PubKey       rsa.PublicKey
+	PubKey       interface{} // *rsa.PublicKey or ed25519.PublicKey
 	ServiceType  []string
 	FlagTesting  bool // flag y
 	FlagIMustBeD bool // flag i
@@ -120,9 +121,11 @@ func NewPubKeyResp(dkimRecord string) (*PubKeyRep, verifyOutput, error) {
 				pkr.HashAlgo = []string{"sha1", "sha256"}
 			}
 		case "k":
-			if strings.ToLower(val) != "rsa" {
+			keyType := strings.ToLower(val)
+			if keyType != "rsa" && keyType != "ed25519" {
 				return nil, PERMFAIL, ErrVerifyBadKeyType
 			}
+			pkr.KeyType = keyType
 		case "n":
 			qp, err := ioutil.ReadAll(quotedprintable.NewReader(strings.NewReader(val)))
 			if err == nil {
@@ -138,9 +141,18 @@ func NewPubKeyResp(dkimRecord string) (*PubKeyRep, verifyOutput, error) {
 			if err != nil {
 				return nil, PERMFAIL, ErrVerifyBadKey
 			}
+			// Try to parse as X.509 PKIX public key first
 			pk, err := x509.ParsePKIXPublicKey(un64)
-			if pk, ok := pk.(*rsa.PublicKey); ok {
-				pkr.PubKey = *pk
+			if err == nil {
+				switch key := pk.(type) {
+				case *rsa.PublicKey:
+					pkr.PubKey = key
+				case ed25519.PublicKey:
+					pkr.PubKey = key
+				}
+			} else if len(un64) == ed25519.PublicKeySize {
+				// Ed25519 public keys in DKIM DNS records are often raw 32-byte keys
+				pkr.PubKey = ed25519.PublicKey(un64)
 			}
 		case "s":
 			t := strings.Split(strings.ToLower(val), ":")
@@ -168,7 +180,7 @@ func NewPubKeyResp(dkimRecord string) (*PubKeyRep, verifyOutput, error) {
 	}
 
 	// if no pubkey
-	if pkr.PubKey == (rsa.PublicKey{}) {
+	if pkr.PubKey == nil {
 		return nil, PERMFAIL, ErrVerifyNoKey
 	}
 
